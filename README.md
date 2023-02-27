@@ -1,3 +1,3 @@
 # IXIS
 Bank Subscription Analysis  
-Reandme file submitted as PDF.
+README file submitted as PDF.
