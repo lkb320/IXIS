@@ -1,0 +1,539 @@
+---
+title: "IXIS"
+author: "LKB"
+date: "2023-02-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+
+library(tidyverse)
+library(here)
+library(kernlab)
+library(caret)
+library(reshape2)
+library(viridis)
+library(glmnet)
+library(corrplot)
+library(randomForest)
+library(varSelRF)
+library(RColorBrewer)
+library(rgl)
+library(ROCR)
+
+set.seed(123)
+
+```
+
+### Data Exploration, Cleaning, etc.
+```{r}
+#Read in data
+path <- here("bank", "bank-full.csv")
+data <- read.delim(path, sep=";", header=TRUE)
+
+#remove any duplicates and rows with missing values
+data <- unique(data) #note: none found
+data <- drop_na(data) #note: none found
+
+#look at data
+glimpse(data)
+```
+
+```{r}
+summary(data)
+```
+
+```{r}
+#duration: last contact duration, in seconds (numeric). Important note: this attribute highly affects the output target (e.g., if duration=0 then y='no'). Yet, the duration is not known before a call is performed. Also, after the end of the call y is obviously known. Thus, this input should only be included for benchmark purposes and should be discarded if the intention is to have a realistic predictive model
+data<- data %>% select(-duration)
+data.outlier <- data #for graphing
+
+#pdays: number of days that passed by after the client was last contacted from a previous campaign (numeric; 999 means client was not previously contacted)
+
+max(data$pdays)
+#max of pdays is 871 --> no 999
+
+#remove outlier for previous @ 119 days
+data <- data %>% filter(previous <= 119)
+```
+
+```{r}
+#change chr to factors
+cols <- c("job", "marital", "education", "contact", "month", "poutcome", "day")
+data[cols] <- lapply(data[cols], factor)
+
+#convert outcome and binary variables to numeric
+data$y <- ifelse(data$y =='no',0,1)
+data$default <- ifelse(data$default =='no',0,1)
+data$housing <- ifelse(data$housing =='no',0,1)
+data$loan <- ifelse(data$loan =='no',0,1)
+
+#Standardize quantitative variables
+numeric = c("age", "balance", "campaign", "pdays", "previous")
+data[,numeric] = scale(data[,numeric])
+```
+
+```{r}
+summary(data)
+```
+
+Look at correlation between numeric predictors.  Pdays and previous look to be significant correlation.
+```{r}
+corrplot(cor(data[,numeric]), type = "upper")
+```
+
+Plot each of the predictor variables against the response.
+From looking at the box plots, the distribution and median/quartiles are not overly skewed, although balance and duration do have quite a few outliers on the upper end.  Also, only campaign shows a visible distribution difference between the box plots by response variable.
+
+```{r, fig.width = 10, fig.height = 8}
+#continuous variables
+data.cont <- data.outlier %>% select(y, age, balance, pdays, previous, campaign,)
+
+df.m <- melt(data.cont, "y") %>%
+  group_by(y, variable, value) %>%
+  tally() %>%
+  ungroup()
+
+ggplot(df.m, aes(as.factor(y), value)) + 
+  geom_boxplot() + 
+  facet_wrap(~variable, scales = "free")
+```
+
+Plot percent acceptance
+```{r, fig.width = 10, fig.height = 8}
+df.w <- dcast(df.m, variable + value ~ y, value.var="n") 
+
+names(df.w) <- c("variable", "value", "no", "yes")
+df.w <- df.w %>%
+  mutate(percent_acceptance = yes/(yes+no)) %>%
+  mutate(percent_acceptance = ifelse(is.na(percent_acceptance), 0, percent_acceptance)) #replace NAs with/0 in the % acceptance
+
+prev <- df.w %>% filter(variable == 'previous')
+
+ggplot(df.w, aes(x = value, y = percent_acceptance)) + 
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_wrap(~variable, scales = "free_x") +
+  ylim(0, 1) +
+  labs(title = "Numerical Factors vs. Percent Acceptance",
+       x = "Value",
+       y = "Percent Acceptance")
+```
+
+
+
+Plot each of the factor predictor variables against the response
+```{r, fig.width = 10, fig.height = 8}
+#discrete variables
+data.disc <- data.outlier %>% select(y, job, marital, education, default, housing, loan, contact, month, poutcome)
+
+df.md <- melt(data.disc, "y")
+
+df.md2 <- df.md %>% 
+  group_by(y, variable, value) %>%
+  tally()
+
+ggplot(df.md2, aes(x = value, y = n, fill = as.factor(y))) + 
+  geom_bar(position="dodge", stat="identity") +
+  scale_fill_viridis(discrete = T) +
+  facet_wrap(~variable, scales = "free") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = "Discreate Potential Predictive Variables and Loan Approval Counts",
+       subtitle = "0 = No, 1 = Yes",
+       y = "Count",
+       x = "Potential Predictive Variable",
+       fill = "Loan Approval")
+```
+
+Split that data into training (70%), validation (15%), and testing data (15%). 
+```{r}
+#use 70% of data set as training set and 30% as test set 
+
+data <- data %>% mutate(id = row_number())
+data2 <- na.omit(data) #check for incomplete data --> none
+
+#use 70% of the data for training --> randomly selected
+train <- data %>% sample_frac(0.7, replace = FALSE) 
+#use remaining 30% of data for validation  (15%) and testing (15%)
+testa <- data %>% anti_join(train, by = 'id') 
+test <- testa %>% sample_frac(0.5, replace = FALSE)
+val <-  testa %>% anti_join(test, by = 'id') %>% select(-id)
+
+#remove id added for training/test separation
+train <- train %>% select(-id)
+test <- test %>% select(-id)
+
+rm(testa)
+```
+
+###Logistic Regression
+Look at each of the variables individually (can do this as the number of features is low)
+```{r}
+model1.age <- glm(y~age, data = train, family = binomial(link = "logit"))
+summary(model1.age)
+```
+```{r}
+model1.job <- glm(y~job, data = train, family = binomial(link = "logit"))
+summary(model1.job)
+```
+```{r}
+model1.mar <- glm(y~marital, data = train, family = binomial(link = "logit"))
+summary(model1.mar)
+```
+
+```{r}
+model1.ed <- glm(y~education, data = train, family = binomial(link = "logit"))
+summary(model1.ed)
+```
+
+```{r}
+model1.def <- glm(y~default, data = train, family = binomial(link = "logit"))
+summary(model1.def)
+```
+
+```{r}
+model1.bal <- glm(y~balance, data = train, family = binomial(link = "logit"))
+summary(model1.bal)
+```
+
+```{r}
+model1.hou <- glm(y~housing, data = train, family = binomial(link = "logit"))
+summary(model1.hou)
+```
+
+
+```{r}
+model1.loan <- glm(y~loan, data = train, family = binomial(link = "logit"))
+summary(model1.loan)
+```
+
+```{r}
+model1.con <- glm(y~contact, data = train, family = binomial(link = "logit"))
+summary(model1.con)
+```
+
+```{r}
+model1.day <- glm(y~day, data = train, family = binomial(link = "logit"))
+summary(model1.day)
+```
+```{r}
+model1.mon <- glm(y~month, data = train, family = binomial(link = "logit"))
+summary(model1.mon)
+```
+
+```{r}
+model1.camp <- glm(y~campaign, data = train, family = binomial(link = "logit"))
+summary(model1.camp)
+```
+
+```{r}
+model1.pday <- glm(y~pdays, data = train, family = binomial(link = "logit"))
+summary(model1.pday)
+```
+
+```{r}
+model1.prev <- glm(y~previous, data = train, family = binomial(link = "logit"))
+summary(model1.prev)
+```
+
+
+```{r}
+model1.pout <- glm(y~poutcome, data = train, family = binomial(link = "logit"))
+summary(model1.pout)
+```
+
+Logistic regression using all of the features as a baseline
+```{r}
+model1 <- glm(y~., data = train, family = binomial(link = "logit"))
+summary(model1)
+```
+Logistic regression using only the significant features (p <= 0.01) from baseline output (not looking at the value of the coefficient at this point)
+```{r}
+model1.reduced <- glm(y~ job + marital + education + balance + housing + loan + contact + day + month + campaign + poutcome , data = train, family = binomial(link = "logit"))
+summary(model1.reduced)
+```
+Is the reduced model better than the full logistic regression model? To test whether the model is better we can perform the partial F test.  No, the reduced model does perform differently (p = 0.028)
+```{r}
+anova(model1.reduced, model1, test="Chisq")
+```
+
+Using elastic net logistic regression to reduce/eliminate features
+The glmnet() function has an alpha argument that determines what type of model is fit. If alpha = 0 then a ridge regression model is fit, and if alpha = 1 then a lasso model is fit. We first determine the optimal regularization parameters based on cross-fold validation AUC.
+
+```{r}
+set.seed(123)
+#Training the regularization parameters
+alpha.list <- seq(0,1,0.1)
+paramtable <- cbind(alpha.list, matrix(0,length(alpha.list),2))
+colnames(paramtable) = c("alpha", "best.Lambda", "AUC")
+
+y <- data.matrix(train[,16]); y2 = y == "yes";
+X <- data.matrix(model.matrix(y ~ ., model.frame(y ~ ., data = train))[,-1])
+
+X_train <- as.matrix(X)
+Y_train <- as.matrix(y)
+
+has_NA <- apply(is.na(X_train), 1, any) #= 1 if any column in that row is NA
+X_train <- X[!has_NA,]
+Y_train <- y[!has_NA,]
+
+#For each alpha, find the best lambda
+for (i in 1:length(alpha.list)){
+L <- cv.glmnet(X_train, Y_train, alpha = alpha.list[i], family = "binomial", type.measure = "auc")
+paramtable[i, 2:3] = c(L$lambda.min, L$cvm[L$lambda == L$lambda.min])
+}
+
+as.data.frame(paramtable) %>% arrange(desc(AUC))
+```
+
+The optimal choice of hyper parameters was \alpha = 0.3 and \lambda = 0.004.  That is, cross validation has chosen a mixture of LASSO (L1) penalty and Ridge regression. (L2 penalty)  Now, using the entire training data set, we train the model using these hyperparameters.
+
+```{r}
+a <- paramtable[paramtable[,3]==max(paramtable[,3]), 1]
+l <- paramtable[paramtable[,3]==max(paramtable[,3]), 2]
+
+model.en <- glmnet(X_train, Y_train, family = "binomial", alpha = a, lambda = l)
+
+coeffs <- coef(model.en) 
+coeffs.dt <- data.frame(name = coeffs@Dimnames[[1]][coeffs@i + 1], coefficient = coeffs@x) 
+
+# reorder the variables in term of coefficients
+coeffs.dt[order(coeffs.dt$coefficient, decreasing = TRUE),]
+```
+```{r}
+coeffs
+```
+
+###Random Forest
+Using the OOB error as minimization criterion, carry out variable elimination from random forest, by successively eliminating the least important variables (with importance as returned from random forest).
+```{r}
+set.seed(123)
+#supervised
+Group_train <- as.factor(Y_train)
+rf.vs1 <- varSelRF::varSelRF(X_train, Group_train, ntree = 5000, ntreeIterat = 2000, vars.drop.frac = 0.2)# take out Y_train here for unsupervised
+
+plot(rf.vs1)
+```
+Selected variables for use in Random Forest model
+```{r}
+rf.vs1$selected.vars
+```
+
+```{r}
+rf.vs1$initialImportances
+```
+
+```{r}
+#write.table(rf.vs1$selected.vars, file = "BANK-rf_selected_variable-022523.txt", quote = FALSE, sep = "\t", row.names = TRUE,col.names = TRUE)
+
+#write.table(rf.vs1$initialImportances, file = "BANK-rf_selected_variables_importances-022523.txt", quote = FALSE, sep = "\t", row.names = TRUE,col.names = TRUE)
+
+#cat("Number of Variables", "OOB", "sd.OOB","\n",  file = "BANK-rf_selection_history-022523.txt",append = TRUE, sep = "\t" )
+
+write.table(paste(rf.vs1$selec.history$Number.Variables, rf.vs1$selec.history$OOB, rf.vs1$selec.history$sd.OOB, sep = "\t"), file = "BANK-rf_selection_history-022523.txt", quote = FALSE, sep = "\t",row.names = FALSE,col.names = FALSE, append = TRUE)
+
+variables <- read.csv("BANK-rf_selection_history-022523.txt", sep = "\t")
+variables
+```
+
+Random Forest using the best classifying/ selected variables.
+```{r}
+memory.limit(50000)
+
+#memory issues --> crashing --> use 50% of the training data for RF--> randomly selected
+train_RF <- train %>% sample_frac(0.5, replace = FALSE) 
+
+yRF <- data.matrix(train_RF[,16]); y2 = y == "yes";
+XRF <-  data.matrix(model.matrix(y ~ ., model.frame(y ~ ., data = train_RF))[,-1])
+
+X_trainRF <- as.matrix(XRF)
+Y_trainRF <- as.matrix(yRF)
+
+has_NA <- apply(is.na(X_trainRF), 1, any) #= 1 if any column in that row is NA
+X_trainRF <- XRF[!has_NA,]
+X_trainRF_df <- as.data.frame(X_trainRF) %>% select(rf.vs1$selected.vars) #random forest using the best classifying variables
+
+Y_trainRF <- yRF[!has_NA,]
+Y_trainRF <- as.factor(Y_trainRF) #run as classification and not regression
+
+#determine mtry that gives the lowest OOB
+mtry <- tuneRF(X_trainRF_df, Y_trainRF ,ntree=1000,
+               stepFactor=1.5,improve=0.01, trace=TRUE, plot=TRUE)
+
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1]
+print(mtry)
+
+print(best.m)
+
+```
+
+```{r}
+set.seed(123)
+##SUPERVISED-VarSelect
+bank.rf.c <- randomForest(X_trainRF_df, Y_trainRF ,ntree=1000, mtry = 3, importance=TRUE, proximity = TRUE) 
+
+varImpPlot(bank.rf.c)
+
+```
+```{r}
+# Get variable importance from the model fit
+ImpData <- as.data.frame(importance(bank.rf.c))
+ImpData$Var.Names <- row.names(ImpData)
+
+ggplot(ImpData, aes(x=Var.Names, y=MeanDecreaseAccuracy))+
+  geom_segment( aes(x=Var.Names, xend=Var.Names, y=0, yend=MeanDecreaseAccuracy), color="skyblue") +
+  geom_point(aes(size = MeanDecreaseGini), color="blue", alpha=0.6) +
+  theme_light() +
+  coord_flip() +
+  theme(
+    legend.position="bottom",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  labs(y="Drop in Accuracy When Removed",
+         x = "Input Variables",
+       size = "Mean Decrease Gini: ~Variable Importance" )
+```
+
+
+```{r}
+print(importance(bank.rf.c)) 
+```
+
+```{r}
+print(bank.rf.c)
+```
+
+
+```{r}
+pred1 <- predict(bank.rf.c,type = "prob")
+
+perf <- prediction(pred1[,2],  Y_trainRF)
+# 1. Area under curve
+auc <- performance(perf, "auc")
+auc@y.values
+
+```
+
+```{r}
+# 2. True Positive and Negative Rate
+pred2 <- performance(perf, "tpr","fpr")
+# 3. Plot the ROC curve
+plot(pred2,main="ROC Curve for Random Forest",col=2,lwd=2)
+abline(a=0,b=1,lwd=2,lty=2,col="gray")
+```
+###Compare performance of Elastic Net Logistic Regression and Random Forest Models Using test data set.
+
+Determine Sensitivity and Specificity for Elastic Net Logistic Regression Model
+```{r}
+#prepare test data
+testy <- data.matrix(test[,16]); y2 = y == "yes";
+testX  <- data.matrix(model.matrix(y ~ ., model.frame(y ~ ., data = test))[,-1])
+
+X_test <- as.matrix(testX)
+Y_test<- as.matrix(testy)
+
+has_NA <- apply(is.na(X_test), 1, any) #= 1 if any column in that row is NA
+X_test <- testX[!has_NA,]
+Y_test <- testy[!has_NA,]
+
+#Predictions on the test set
+predict.en.glm <- predict(model.en, newx = X_test , type = "response")
+
+#Creating confusion matrix
+pred.val <- as.data.frame(ifelse(predict.en.glm >= 0.5, 1, 0))
+colnames(pred.val) <- c("pred_val")
+exp.val <- as.data.frame(test$y)
+colnames(exp.val) <- c("exp_val")
+CM.en <- confusionMatrix(data= as.factor(pred.val$pred_val), reference = as.factor(exp.val$exp_val))
+
+CM.en 
+```
+
+Determine AUC for Elastic Net Logistic Regression Model
+```{r}
+# Area under curve
+perf.en <- prediction(predict.en.glm[,1],  exp.val$exp_val)
+auc <- performance(perf.en, "auc")
+auc@y.values
+
+```
+```{r}
+# 2. True Positive and Negative Rate
+pred.en = performance(perf.en, "tpr","fpr")
+# 3. Plot the ROC curve
+plot(pred.en,main="ROC Curve for Elastic Net Logistic Regression",col=2,lwd=2)
+abline(a=0,b=1,lwd=2,lty=2,col="gray")
+```
+
+Determine Sensitivity and Specificity for Random Forest Classification Model
+```{r}
+#Predictions on the test set
+predict.rf1 <- predict(bank.rf.c, newdata = X_test , type = "prob") # X_test -->  6782
+pred.val.rf <- as.data.frame(ifelse(predict.rf1[,1] >=0.5, 0, 1)) 
+colnames(pred.val.rf) <- c("pred_val")
+
+#Creating confusion matrix
+CM.rf <- confusionMatrix(data= as.factor(pred.val.rf$pred_val), reference = as.factor(exp.val$exp_val))
+
+CM.rf 
+```
+
+Determine AUC for Random Forest Model
+```{r}
+# Area under curve
+
+perf.rf <- prediction(pred.val.rf[,1],  exp.val$exp_val)
+auc.rf <- performance(perf.rf, "auc")
+auc.rf@y.values
+
+```
+
+```{r}
+# 2. True Positive and Negative Rate
+pred.rf = performance(perf.rf, "tpr","fpr")
+# 3. Plot the ROC curve
+plot(pred.rf,main="ROC Curve for Random Forest",col=2,lwd=2)
+abline(a=0,b=1,lwd=2,lty=2,col="gray")
+```
+
+#Visual aids for presentation.
+```{r}
+en.coeff <- coeffs.dt[order(coeffs.dt$coefficient, decreasing = TRUE),]
+
+en.coeff.sub <- en.coeff %>% slice(1:10 , 48:57) %>%
+  mutate(relative.effect  = coefficient/(min(abs(coefficient)))) %>%
+  mutate(name = str_replace(name, "(Intercept)", "jobadmin"))
+
+en.coeff.sub  %>% ggplot(aes(x=name, y=relative.effect))+
+  geom_segment( aes(x=name, xend=name, y=0, yend=relative.effect), color="skyblue") +
+  geom_point(aes(size = abs(relative.effect), color= relative.effect>0), alpha=0.6) + #"blue"
+  theme_light() +
+  coord_flip() +
+  theme(
+    legend.position="bottom",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  labs(y="Relative Effect on Term Deposit Subscirption",
+         x = "Input Variables",
+       size = "Relative Effect: ~Variable Importance") +
+  guides(color = "none")
+
+  
+
+```
+
+```{r}
+en.pred.out <- as.data.frame(predict.en.glm)
+en.pred.out %>% ggplot(aes(x = s0)) +
+  geom_histogram() +
+  geom_vline(xintercept = 0.5, color = "blue", size = 1.5) +
+  labs(title = "Score of Campaign Cunstomer Outcome",
+       x="Score, <0.5 = No Success",
+        y = "Count")
+```
+
